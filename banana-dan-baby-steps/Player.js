@@ -5,89 +5,209 @@ class Player {
     constructor() {
         this.turn = 0;
         this.warrior = new SmartWarrior();
+        this.prevEnemyAhead = null;
+        this.prevEnemyBehind = null;
     }
 
-    playTurn(warrior) {
+    playTurn(gameWarrior) {
+        // Model update and other bookkeeping.
         ++this.turn;
-        warrior = this.warrior.update(warrior);
+        const warrior = this.warrior.update(gameWarrior);
+
+        warrior.think(`I took ${warrior.damageTaken()} damage last turn.`);
         this.warrior.thinkAboutMentalMap();
 
-        if (this.turn === 1) {
+        const enemyAhead = findFirstEnemy(warrior.mentalMap, 'forward');
+        const enemyBehind = findFirstEnemy(warrior.mentalMap, 'backward');
+
+        // This is an easy hack for level 9 of Baby Steps.
+        if (this.turn === 1 && enemyBehind && enemyBehind.dist <= 3) {
             warrior.pivot();
             return;
         }
 
-        const walk = warrior.mentalMap.mentalWalk();
-        const nextSquare = walk.forward();
+        detectEnemyTypes(
+            warrior,
+            enemyAhead,
+            enemyBehind,
+            this.prevEnemyAhead,
+            this.prevEnemyBehind
+        );
 
+        // When my health is very low I walk backward to safety (if it is indeed safe behind me) and heal myself up.
         if (
-            warrior.health() <= 11
-            && warrior.isTakingDamage()
-            && !enemiesBehind(warrior.mentalMap)
+            warrior.health() < 4
+            && warrior.damageTaken()
+            && (!enemyBehind || enemyBehind.dist > 4)
         ) {
             warrior.walk('backward');
             return;
         }
 
-        if (warrior.health() <= 18 && !warrior.isTakingDamage()) {
+        // When my health is low and it's safe, I heal up.
+        const areaCompletedForward = warrior.mentalMap.isCompleted('forward');
+        const areaCompletedBackward = warrior.mentalMap.isCompleted('backward');
+        const areaCompleted = areaCompletedForward && areaCompletedForward;
+        const dangerousEnemyAhead = enemyAhead
+            && enemyAhead.dist <= 3
+            && (enemyAhead.unit.attackRange() == null
+                || enemyAhead.unit.attackRange() >= enemyAhead.dist);
+
+        if (
+            warrior.health() < 7
+            && !warrior.damageTaken()
+            && !dangerousEnemyAhead
+            && !areaCompleted
+        ) {
             warrior.rest();
             return;
         }
 
-        if (nextSquare.isWall()) {
-            warrior.pivot();
-            return;
-        }
+        // Check whether I can see a wall behind me but no stairs.
+        // If so and there's something interesting behind me, I pivot and do that part of the area first.
+        const backWalk = warrior.mentalMap.mentalWalk();
+        let square = null;
+        let foundSomething = false;
 
-        if (nextSquare.isUnit()) {
-            if (nextSquare.getUnit().isEnemy()) {
-                warrior.attack();
-                return;
-            } else if (nextSquare.getUnit().isBound()) {
-                warrior.rescue();
+        while (square = backWalk.backward()) {
+            if (square.isUnit()) {
+                foundSomething = true;
+            } else if (square.isStairs()) {
+                break;
+            } else if (square.isWall() && foundSomething) {
+                warrior.pivot();
                 return;
             }
         }
 
-        // Check the squares ahead for captives, enemies and stairs.
-        let square = null;
-        let i = 0;
+        // Check the squares ahead.
+        const walk = warrior.mentalMap.mentalWalk();
+        let dist = 0;
 
-        while ((square = walk.forward()) && i++ < 2) {
-            // Walk towards captives and shoot enemies.
+        while ((square = walk.forward())) {
+            ++dist;
+
+            // Deal with captives and enemies.
             if (square.isUnit()) {
-                if (square.getUnit().isBound()) {
+                const unit = square.getUnit();
+
+                if (dist === 1) {
+                    // I attack enemies and rescue captives in front of me.
+                    if (unit.isBound()) {
+                        warrior.rescue();
+                        return;
+                    } else if (unit.isEnemy()) {
+                        warrior.attack();
+                        return;
+                    }
+                } else if (dist <= 3) {
+                    // I shoot nearby enemies.
+                    if (square.getUnit().isEnemy()) {
+                        warrior.shoot();
+                        return;
+                    }
+                }
+
+                break;
+            }
+
+            // If I get this far and I find a wall or stairs but I haven't completed the area yet I pivot and kick more ass.
+            if (square.isStairs()) {
+                if (areaCompletedBackward) {
                     break;
-                } else if (square.getUnit().isEnemy()) {
-                    warrior.shoot();
+                } else {
+                    warrior.pivot();
                     return;
                 }
-            }
-
-            // If we get this far and we find stairs then we walk toward them, except when we haven't fully completed the area yet.
-            // In that case we pivot and kick more ass.
-            if (square.isStairs() && !warrior.mentalMap.isCompleted()) {
+            } else if (square.isWall()) {
                 warrior.pivot();
                 return;
             }
         }
 
         warrior.walk();
+
+        this.prevEnemyAhead = enemyAhead;
+        this.prevEnemyBehind = enemyBehind;
     }
 }
 
-function enemiesBehind(mentalMap) {
-    const walk = mentalMap.mentalWalk();
-    let square = null;
-    let i = 0;
+/**
+ * What's trying to murder me and what are its properties?
+ * Let's do an ethological study.
+ * TODO: detect enemy types based on the amount of damage they've taken.
+ */
+function detectEnemyTypes(
+    warrior, enemyAhead, enemyBehind, prevEnemyAhead, prevEnemyBehind) {
+    const closeEnemies = [];
 
-    while ((square = walk.backward()) && i++ < 3) {
-        if (square.isUnit() && square.getUnit().isEnemy()) {
-            return true;
+    // Check whether an enemy just died infront of the nearest enemies, in that case I can't say whether they've tried to hit me.
+    if (enemyAhead && (!prevEnemyAhead || enemyAhead === prevEnemyAhead)) {
+        closeEnemies.push(enemyAhead);
+    }
+
+    if (enemyBehind && (!prevEnemyBehind || enemyBehind === prevEnemyBehind)) {
+        closeEnemies.push(enemyBehind);
+    }
+
+    const lastMove = warrior.moves[warrior.moves.length - 1];
+
+    // If I haven't made a move yet or I only just walked within range I can't be sure whether the enemies attack or not.
+    if (lastMove && lastMove.type !== 'walk') {
+        if (closeEnemies.length === 1) {
+            closeEnemies[0].unit.itAttacksFromDist(
+                warrior.damageTaken() > 0,
+                warrior.damageTaken(),
+                closeEnemies[0].dist
+            );
+        } else if (warrior.damageTaken() === 0) {
+            closeEnemies.forEach(({ unit, dist }) => {
+                unit.itAttacksFromDist(
+                    warrior.damageTaken() > 0,
+                    warrior.damageTaken(),
+                    dist
+                );
+            });
+        } else if (warrior.damageTaken() === 6) {
+            closeEnemies.forEach(({ unit, dist }) => {
+                unit.itAttacksFromDist(true, 3, dist);
+            });
+        } else if (warrior.damageTaken() > 6) {
+            closeEnemies.forEach(({ unit, dist }) => {
+                unit.itAttacksFromDist(true, null, dist);
+            });
         }
     }
 
-    return false;
+    if (enemyAhead) {
+        thinkAboutEnemy(warrior, enemyAhead, 'ahead of');
+    }
+
+    if (enemyBehind) {
+        thinkAboutEnemy(warrior, enemyBehind, 'behind');
+    }
+}
+
+function thinkAboutEnemy(warrior, { unit, dist }, where) {
+    const type = unit.type() || 'enemy';
+    const aType = type[0] === 'a' || type[0] === 'e'
+        ? `an ${type}`
+        : `a ${type}`;
+    warrior.think(`There is ${aType} ${dist} squares ${where} me with attack range ${unit.attackRange()}, attack damage ${unit.attackDamage()}.`);
+}
+
+function findFirstEnemy(mentalMap, relDir) {
+    let walk = mentalMap.mentalWalk();
+    let square = null;
+
+    while (square = walk.walk(relDir)) {
+        if (square.isUnit() && square.getUnit().isEnemy()) {
+            return {
+                unit: square.getUnit(),
+                dist: Math.abs(mentalMap.curr.x - square.x)
+            };
+        }
+    }
 }
 
 /**
@@ -97,13 +217,17 @@ class SmartWarrior {
     constructor() {
         this.warrior = null;
         this.mentalMap = new MentalMap();
+        this.moves = [];
     }
 
     update(warrior) {
         this.warrior = warrior;
         this._prevHealth = this._health;
         this._health = this.health();
-        this._takingDamage = this._health < this._prevHealth;
+        this._damageTaken = Math.max(
+            0,
+            (this._prevHealth || 20) - this._health
+        );
 
         this.mentalMap.update(
             warrior.look('forward'), warrior.look('backward'));
@@ -121,6 +245,8 @@ class SmartWarrior {
             square.getUnit().hurt(5);
         }
 
+        this.moves.push({ type: 'attack', relDir });
+
         return this;
     }
 
@@ -137,6 +263,8 @@ class SmartWarrior {
             }
         }
 
+        this.moves.push({ type: 'pivot', relDir });
+
         return this;
     }
 
@@ -146,10 +274,15 @@ class SmartWarrior {
         this.mentalMap.mentalWalk()
             .forward()
             .rescue();
+
+        this.moves.push({ type: 'rescue', relDir });
+
+        return this;
     }
 
     rest() {
         this.warrior.rest();
+        this.moves.push({ type: 'rest' });
         return this;
     }
 
@@ -168,12 +301,15 @@ class SmartWarrior {
             }
         }
 
+        this.moves.push({ type: 'shoot', relDir });
+
         return this;
     }
 
     walk(relDir) {
         this.warrior.walk(relDir);
         this.mentalMap.walk(relDir);
+        this.moves.push({ type: 'walk', relDir });
         return this;
     }
 
@@ -183,8 +319,8 @@ class SmartWarrior {
         return this.warrior.health();
     }
 
-    isTakingDamage() {
-        return this._takingDamage;
+    damageTaken() {
+        return this._damageTaken;
     }
 
     think(about) {
@@ -241,19 +377,21 @@ class MentalMap {
         }
     }
 
-    isCompleted() {
-        const arr = this.toArray();
-        const first = arr[0];
-        const last = arr[arr.length - 1];
+    isCompleted(relDir) {
+        const walk = this.mentalWalk();
+        let square = null;
 
-        if (
-            !(first.isWall() || first.isStairs())
-            || !(last.isWall() || last.isStairs())
-        ) {
-            return false;
+        while (square = walk.walk(relDir)) {
+            if (square.isUnit()) {
+                return false;
+            }
+
+            if (square.isStairs() || square.isWall()) {
+                return true;
+            }
         }
 
-        return !arr.some(sq => sq.isUnit());
+        return false;
     }
 
     walk(relDir) {
@@ -293,16 +431,16 @@ class MentalMap {
                     } else if (sq.getUnit().isBound()) {
                         return 'C';
                     } else {
-                        return 'X'
+                        return 'X';
                     }
-                } else if (sq.rescuedUnits().length) {
-                    return 'R';
-                } else if (sq.killedUnits().length) {
-                    return 'k';
                 } else if (sq.isStairs()) {
                     return '>';
                 } else if (sq.isWall()) {
                     return '║';
+                } else if (sq.rescuedUnits().length) {
+                    return 'R';
+                } else if (sq.deadUnits().length) {
+                    return '✝';
                 } else {
                     return ' ';
                 }
@@ -318,7 +456,7 @@ class Square {
     constructor(x, space) {
         this.x = x;
         this._rescuedUnits = [];
-        this._killedUnits = [];
+        this._deadUnits = [];
         this.left = null;
         this.right = null;
         this.update(space);
@@ -332,12 +470,14 @@ class Square {
                 if (this._simulacrum) {
                     this._simulacrum.update(space.getUnit());
                 } else {
-                    this._simulacrum = new Simulacrum(space.getUnit());
+                    this._simulacrum = new Simulacrum(space.getUnit(), this);
                 }
             } else if (this.isUnit()) {
                 if (this._simulacrum.isEnemy()) {
-                    this._killedUnits.push(this._simulacrum);
+                    this._simulacrum.kill();
+                    this._deadUnits.push(this._simulacrum);
                 } else {
+                    this._simulacrum.rescue();
                     this._rescuedUnits.push(this._simulacrum);
                 }
 
@@ -348,6 +488,7 @@ class Square {
 
     rescue() {
         if (this._simulacrum && this._simulacrum.isBound()) {
+            this._simulacrum.rescue();
             this._rescuedUnits.push(this._simulacrum);
             this._simulacrum = null;
         }
@@ -361,8 +502,8 @@ class Square {
         return this._rescuedUnits;
     }
 
-    killedUnits() {
-        return this._killedUnits;
+    deadUnits() {
+        return this._deadUnits;
     }
 
     getUnit() {
@@ -382,13 +523,48 @@ class Square {
  * Simulates a unit.
  */
 class Simulacrum {
-    constructor(unit) {
+    constructor(unit, square) {
         this._damage = 0;
+        this._state = 'alive';
+        this._square = square;
         this.update(unit);
+
+        if (this.isEnemy()) {
+            this._possibleTypes = new Set([
+                'sludge',
+                'thick-sludge',
+                'archer',
+                'wizard'
+            ]);
+            this._type = null;
+            this._maxHealth = null;
+            this._attacks = null;
+            this._attackDamage = null;
+            this._attackRange = null;
+            this._doesntAttackLongRange = null;
+        } else {
+            this._possibleTypes = new Set([
+                'captive'
+            ]);
+            this._type = 'captive';
+            this._maxHealth = 1;
+            this._attacks = false;
+            this._attackDamage = 0;
+            this._attackRange = 0;
+            this._doesntAttackLongRange = true;
+        }
     }
 
     update(unit) {
         this._unit = unit;
+    }
+
+    type() {
+        return this._type;
+    }
+
+    possibleTypes() {
+        return this._possibleTypes;
     }
 
     isBound() {
@@ -403,8 +579,155 @@ class Simulacrum {
         this._damage += damage;
     }
 
+    health() {
+        return this._maxHealth && Math.max(0, this._maxHealth - this._damage);
+    }
+
     damage() {
         return this._damage;
+    }
+
+    isAlive() {
+        return this._state === 'alive';
+    }
+
+    kill() {
+        this._state = 'dead';
+    }
+
+    rescue() {
+        this._state = 'rescued';
+    }
+
+    square() {
+        return this._square;
+    }
+
+    itsNotA(type) {
+        this._possibleTypes.delete(type);
+        this._inferProperties();
+    }
+
+    itAttacksFromDist(value, damage, dist) {
+        if (value) {
+            this._attacks = true;
+
+            if (damage != null) {
+                this._attackDamage = damage;
+            }
+
+            if (dist > 1) {
+                this._attackRange = 3;
+            }
+        } else {
+            if (dist === 1) {
+                this._attacks = false;
+                this._attackDamage = 0;
+                this._attackRange = 0;
+            } else if (dist <= 3) {
+                this._doesntAttackLongRange = true;
+            }
+        }
+
+        if (this._attacks === true && this._doesntAttackLongRange === true) {
+            this._attackRange = 1;
+        }
+
+        this._inferProperties();
+    }
+
+    attacks() {
+        return this._attacks;
+    }
+
+    attackDamage() {
+        return this._attackDamage;
+    }
+
+    attackRange() {
+        return this._attackRange;
+    }
+
+    _inferProperties() {
+        if (this._possibleTypes.size !== 1) {
+            // Remove possibilities based on whether it attacks.
+            if (this._attacks === false) {
+                this._possibleTypes.delete('archer');
+                this._possibleTypes.delete('wizard');
+            }
+
+            // Remove possibilities based on attack range.
+            if (this._attackRange === 1
+                || this._doesntAttackLongRange === true) {
+                this._possibleTypes.delete('archer');
+                this._possibleTypes.delete('wizard');
+            } else if (this._attackRange === 3) {
+                this._possibleTypes.delete('sludge');
+                this._possibleTypes.delete('thick-sludge');
+            }
+
+            // Remove possibilities based on attack damage.
+            if (this._attackDamage === 3) {
+                this._possibleTypes.delete('wizard');
+            } else if (this._attackDamage === 11) {
+                this._possibleTypes.delete('sludge');
+                this._possibleTypes.delete('thick-sludge');
+                this._possibleTypes.delete('archer');
+            }
+        }
+
+        // Infer all properties when I've whittled the possiblities down to one.
+        if (this._possibleTypes.size === 1) {
+            this._type = this._possibleTypes.values().next().value;
+
+            if (this._type === 'sludge') {
+                this._maxHealth = 12;
+
+                if (this._attacks) {
+                    this._attackDamage = 3;
+                    this._attackRange = 1;
+                }
+            } else if (this._type === 'thick-sludge') {
+                this._maxHealth = 24;
+
+                if (this._attacks) {
+                    this._attackDamage = 3;
+                    this._attackRange = 1;
+                }
+            } else if (this._type === 'archer') {
+                this._maxHealth = 7;
+                this._attacks = true;
+                this._attackDamage = 3;
+                this._attackRange = 3;
+            } else if (this._type === 'wizard') {
+                this._maxHealth = 3;
+                this._attacks = true;
+                this._attackDamage = 11;
+                this._attackRange = 3;
+            }
+        }
+
+        // Infer some properties when I've whittled the possiblities down to two.
+        if (this._possibleTypes.size === 2) {
+            if (this._possibleTypes.has('wizard')) {
+                if (this._possibleTypes.has('archer')) {
+                    this._attacks = true;
+                    this._attackRange = 3;
+                }
+            } else if (this._attacks === true) {
+                this._attackDamage = 3;
+
+                if (!this._possibleTypes.has('archer')) {
+                    this._attackRange = 1;
+                }
+            }
+        }
+
+        // Cleanup.
+        if (this._attacks === false) {
+            this._attackDamage = 0;
+            this._attackRange = 0;
+        }
     }
 }
 
