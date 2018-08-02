@@ -5,8 +5,8 @@ class Player {
     constructor() {
         this.turn = 0;
         this.warrior = new SmartWarrior();
-        this.prevEnemyAhead = null;
-        this.prevEnemyBehind = null;
+        this.prevUnitAhead = null;
+        this.prevUnitBehind = null;
     }
 
     playTurn(gameWarrior) {
@@ -17,47 +17,52 @@ class Player {
         warrior.think(`I took ${warrior.damageTaken()} damage last turn.`);
         this.warrior.thinkAboutMentalMap();
 
-        const enemyAhead = findFirstEnemy(warrior.mentalMap, 'forward');
-        const enemyBehind = findFirstEnemy(warrior.mentalMap, 'backward');
+        const unitAhead = findFirstUnit(warrior.mentalMap, 'forward');
+        const unitBehind = findFirstUnit(warrior.mentalMap, 'backward');
 
-        // This is an easy hack for level 9 of Baby Steps.
-        if (this.turn === 1 && enemyBehind && enemyBehind.dist <= 3) {
-            warrior.pivot();
-            return;
-        }
-
-        detectEnemyTypes(
+        detectUnitTypes(
             warrior,
-            enemyAhead,
-            enemyBehind,
-            this.prevEnemyAhead,
-            this.prevEnemyBehind
+            unitAhead,
+            unitBehind,
+            this.prevUnitAhead,
+            this.prevUnitBehind
         );
 
-        // When my health is very low I walk backward to safety (if it is indeed safe behind me) and heal myself up.
+        this.prevUnitAhead = unitAhead;
+        this.prevUnitBehind = unitBehind;
+
+        // When my health is very low, I walk backward to safety (if it's indeed safe behind me) and heal myself next turn.
         if (
             warrior.health() < 4
             && warrior.damageTaken()
-            && (!enemyBehind || enemyBehind.dist > 4)
+            && (!unitBehind || !unitBehind.unit.isEnemy() || unitBehind.dist > 4)
+            && unitAhead
+            && unitAhead.unit.attackRangeMax() >= unitAhead.dist
         ) {
-            warrior.walk('backward');
-            return;
+            // If I can kill the enemy in one hit, I stay put and attack.
+            if (unitAhead.unit.health() <= 5 && unitAhead.dist <= 1) {
+                warrior.attack();
+                return;
+            } else if (unitAhead.unit.health() <= 3 && unitAhead.dist <= 3) {
+                warrior.shoot();
+                return;
+            } else {
+                warrior.walk('backward');
+                return;
+            }
         }
 
-        // When my health is low and it's safe, I heal up.
-        const areaCompletedForward = warrior.mentalMap.isCompleted('forward');
+        // When my health is low and i'm safe, I heal up.
         const areaCompletedBackward = warrior.mentalMap.isCompleted('backward');
-        const areaCompleted = areaCompletedForward && areaCompletedForward;
-        const dangerousEnemyAhead = enemyAhead
-            && enemyAhead.dist <= 3
-            && (enemyAhead.unit.attackRange() == null
-                || enemyAhead.unit.attackRange() >= enemyAhead.dist);
+        const enemiesAlive = enemyMightBeAlive(warrior.mentalMap);
+        const dangerousEnemyAhead = unitAhead
+            && unitAhead.unit.attackRangeMax() >= unitAhead.dist;
 
         if (
             warrior.health() < 7
             && !warrior.damageTaken()
             && !dangerousEnemyAhead
-            && !areaCompleted
+            && enemiesAlive
         ) {
             warrior.rest();
             return;
@@ -83,85 +88,120 @@ class Player {
         // Check the squares ahead.
         const walk = warrior.mentalMap.mentalWalk();
         let dist = 0;
+        let firstUnit = null;
+        let firstUnitDist = null;
+        let enemiesAhead = 0;
 
         while ((square = walk.forward())) {
             ++dist;
 
-            // Deal with captives and enemies.
+            // Detect captives and enemies.
             if (square.isUnit()) {
                 const unit = square.getUnit();
 
-                if (dist === 1) {
-                    // I attack enemies and rescue captives in front of me.
-                    if (unit.isBound()) {
-                        warrior.rescue();
-                        return;
-                    } else if (unit.isEnemy()) {
-                        warrior.attack();
+                if (!firstUnit) {
+                    firstUnit = unit;
+                    firstUnitDist = dist;
+                }
+
+                if (unit.isEnemy()) {
+                    ++enemiesAhead;
+                }
+            }
+
+            // If I get this far and I find a wall or stairs but I haven't completed the area yet I pivot and kick more ass.
+            if (!firstUnit) {
+                if (square.isStairs()) {
+                    if (areaCompletedBackward) {
+                        break;
+                    } else {
+                        warrior.pivot();
                         return;
                     }
-                } else if (dist <= 3) {
-                    // I shoot nearby enemies.
-                    if (square.getUnit().isEnemy()) {
+                } else if (square.isWall()) {
+                    warrior.pivot();
+                    return;
+                }
+            }
+        }
+
+        // Deal with captives and enemies.
+        if (firstUnit) {
+            if (firstUnitDist === 1) {
+                // I attack enemies and rescue captives in front of me.
+                if (firstUnit.isBound()) {
+                    warrior.rescue();
+                    return;
+                } else if (firstUnit.isEnemy()) {
+                    warrior.attack();
+                    return;
+                }
+            } else if (firstUnitDist === 2) {
+                // I attack nearby ranged enemies.
+                if (firstUnit.isEnemy()) {
+                    if (firstUnit.attackDamageMax() > 3
+                        && firstUnit.attackRangeMax() >= firstUnitDist) {
+                        warrior.think("The next enemy might be a wizard, I'll shoot it from a distance.");
+                        warrior.shoot();
+                        return;
+                    } else if (firstUnit.attackRangeMax() <= 1
+                        && warrior.health() < 10) {
+                        warrior.think("There are too many enemies ahead, I'll kill them from a distance.");
                         warrior.shoot();
                         return;
                     }
                 }
-
-                break;
-            }
-
-            // If I get this far and I find a wall or stairs but I haven't completed the area yet I pivot and kick more ass.
-            if (square.isStairs()) {
-                if (areaCompletedBackward) {
-                    break;
-                } else {
-                    warrior.pivot();
-                    return;
+            } else if (firstUnitDist === 3) {
+                // I shoot nearby ranged enemies.
+                if (firstUnit.isEnemy()) {
+                    if (firstUnit.attackRangeMax() > 1) {
+                        warrior.think("This enemy might hit me from afar, I'll kill it from a distance.");
+                        warrior.shoot();
+                        return;
+                    } else if (warrior.health() < 10) {
+                        warrior.think("There are too many enemies ahead, I'll kill them from a distance.");
+                        warrior.shoot();
+                        return;
+                    }
                 }
-            } else if (square.isWall()) {
-                warrior.pivot();
-                return;
             }
         }
 
         warrior.walk();
-
-        this.prevEnemyAhead = enemyAhead;
-        this.prevEnemyBehind = enemyBehind;
     }
 }
 
 /**
  * What's trying to murder me and what are its properties?
  * Let's do an ethological study.
- * TODO: detect enemy types based on the amount of damage they've taken.
  */
-function detectEnemyTypes(
-    warrior, enemyAhead, enemyBehind, prevEnemyAhead, prevEnemyBehind) {
-    const closeEnemies = [];
+function detectUnitTypes(
+    warrior, unitAhead, unitBehind, prevUnitAhead, prevUnitBehind) {
+    const closeUnits = [];
 
-    // Check whether an enemy just died infront of the nearest enemies, in that case I can't say whether they've tried to hit me.
-    if (enemyAhead && (!prevEnemyAhead || enemyAhead === prevEnemyAhead)) {
-        closeEnemies.push(enemyAhead);
+    // Check whether an enemy just died or a captive was just rescued infront of the nearest enemies, in that case I can't say whether they've tried to hit me.
+    if (unitAhead
+        && (!prevUnitAhead || unitAhead.unit === prevUnitAhead.unit)) {
+        closeUnits.push(unitAhead);
     }
 
-    if (enemyBehind && (!prevEnemyBehind || enemyBehind === prevEnemyBehind)) {
-        closeEnemies.push(enemyBehind);
+    if (unitBehind
+        && (!prevUnitBehind || unitBehind.unit === prevUnitBehind.unit)) {
+        closeUnits.push(unitBehind);
     }
 
     const lastMove = warrior.moves[warrior.moves.length - 1];
 
     // If I haven't made a move yet or I only just walked within range I can't be sure whether the enemies attack or not.
     if (lastMove && lastMove.type !== 'walk') {
-        if (closeEnemies.length === 1) {
-            closeEnemies[0].unit.itAttacksFromDist(
+        if (closeUnits.length === 1) {
+            closeUnits[0].unit.itAttacksFromDist(
                 warrior.damageTaken() > 0,
                 warrior.damageTaken(),
-                closeEnemies[0].dist
+                closeUnits[0].dist
             );
         } else if (warrior.damageTaken() === 0) {
-            closeEnemies.forEach(({ unit, dist }) => {
+            closeUnits.forEach(({ unit, dist }) => {
                 unit.itAttacksFromDist(
                     warrior.damageTaken() > 0,
                     warrior.damageTaken(),
@@ -169,45 +209,72 @@ function detectEnemyTypes(
                 );
             });
         } else if (warrior.damageTaken() === 6) {
-            closeEnemies.forEach(({ unit, dist }) => {
+            closeUnits.forEach(({ unit, dist }) => {
                 unit.itAttacksFromDist(true, 3, dist);
             });
         } else if (warrior.damageTaken() > 6) {
-            closeEnemies.forEach(({ unit, dist }) => {
+            closeUnits.forEach(({ unit, dist }) => {
                 unit.itAttacksFromDist(true, null, dist);
             });
         }
     }
 
-    if (enemyAhead) {
-        thinkAboutEnemy(warrior, enemyAhead, 'ahead of');
+    if (unitAhead) {
+        thinkAboutUnit(warrior, unitAhead, 'ahead of');
     }
 
-    if (enemyBehind) {
-        thinkAboutEnemy(warrior, enemyBehind, 'behind');
+    if (unitBehind) {
+        thinkAboutUnit(warrior, unitBehind, 'behind');
     }
 }
 
-function thinkAboutEnemy(warrior, { unit, dist }, where) {
+function thinkAboutUnit(warrior, { unit, dist }, where) {
     const type = unit.type() || 'enemy';
     const aType = type[0] === 'a' || type[0] === 'e'
         ? `an ${type}`
         : `a ${type}`;
-    warrior.think(`There is ${aType} ${dist} squares ${where} me with attack range ${unit.attackRange()}, attack damage ${unit.attackDamage()}.`);
+    warrior.think(`There is ${aType} ${dist} squares ${where} me with max attack range ${unit.attackRangeMax()}, max attack damage ${unit.attackDamageMax()}.`);
 }
 
-function findFirstEnemy(mentalMap, relDir) {
-    let walk = mentalMap.mentalWalk();
+function findFirstUnit(mentalMap, relDir) {
+    const walk = mentalMap.mentalWalk();
     let square = null;
 
     while (square = walk.walk(relDir)) {
-        if (square.isUnit() && square.getUnit().isEnemy()) {
+        if (square.isUnit()) {
             return {
                 unit: square.getUnit(),
                 dist: Math.abs(mentalMap.curr.x - square.x)
             };
         }
     }
+}
+
+function enemyMightBeAlive(mentalMap) {
+    let walk = mentalMap.mentalWalk();
+    let square = null;
+    let startFound = false;
+    let endFound = false;
+
+    while (square = walk.walk()) {
+        if (square.isUnit() && square.getUnit().isEnemy()) {
+            return true;
+        } else if (square.isWall() || square.isStairs()) {
+            endFound = true;
+        }
+    }
+
+    walk = mentalMap.mentalWalk();
+
+    while (square = walk.walk('backward')) {
+        if (square.isUnit() && square.getUnit().isEnemy()) {
+            return true;
+        } else if (square.isWall() || square.isStairs()) {
+            startFound = true;
+        }
+    }
+
+    return !(startFound && endFound);
 }
 
 /**
@@ -397,7 +464,7 @@ class MentalMap {
     walk(relDir) {
         const dir = relDir === 'backward' ? this.oppDir : this.dir;
 
-        if (this.curr[dir]) {
+        if (this.curr[dir] && this.curr[dir].isEmpty()) {
             this.curr = this.curr[dir];
         }
     }
@@ -475,13 +542,9 @@ class Square {
             } else if (this.isUnit()) {
                 if (this._simulacrum.isEnemy()) {
                     this._simulacrum.kill();
-                    this._deadUnits.push(this._simulacrum);
                 } else {
                     this._simulacrum.rescue();
-                    this._rescuedUnits.push(this._simulacrum);
                 }
-
-                this._simulacrum = null;
             }
         }
     }
@@ -489,13 +552,11 @@ class Square {
     rescue() {
         if (this._simulacrum && this._simulacrum.isBound()) {
             this._simulacrum.rescue();
-            this._rescuedUnits.push(this._simulacrum);
-            this._simulacrum = null;
         }
     }
 
     isUnit() {
-        return this._simulacrum != null;
+        return this._simulacrum != null && this.space.isUnit();
     }
 
     rescuedUnits() {
@@ -516,6 +577,10 @@ class Square {
 
     isWall() {
         return this.space && this.space.isWall();
+    }
+
+    isEmpty() {
+        return this.space == null || this.space.isEmpty();
     }
 }
 
@@ -540,7 +605,9 @@ class Simulacrum {
             this._maxHealth = null;
             this._attacks = null;
             this._attackDamage = null;
+            this._attackDamageMax = 11;
             this._attackRange = null;
+            this._attackRangeMax = 3;
             this._doesntAttackLongRange = null;
         } else {
             this._possibleTypes = new Set([
@@ -550,7 +617,9 @@ class Simulacrum {
             this._maxHealth = 1;
             this._attacks = false;
             this._attackDamage = 0;
+            this._attackDamageMax = 0;
             this._attackRange = 0;
+            this._attackRangeMax = 0;
             this._doesntAttackLongRange = true;
         }
     }
@@ -576,7 +645,15 @@ class Simulacrum {
     }
 
     hurt(damage) {
-        this._damage += damage;
+        if (this.isAlive()) {
+            this._damage += damage;
+
+            if (!this.square().isUnit()) {
+                this.kill();
+            }
+
+            this._inferProperties();
+        }
     }
 
     health() {
@@ -593,10 +670,14 @@ class Simulacrum {
 
     kill() {
         this._state = 'dead';
+        this._square._deadUnits.push(this._simulacrum);
+        this._square._simulacrum = null;
     }
 
     rescue() {
         this._state = 'rescued';
+        this._square._rescuedUnits.push(this._simulacrum);
+        this._square._simulacrum = null;
     }
 
     square() {
@@ -644,8 +725,16 @@ class Simulacrum {
         return this._attackDamage;
     }
 
+    attackDamageMax() {
+        return this._attackDamageMax;
+    }
+
     attackRange() {
         return this._attackRange;
+    }
+
+    attackRangeMax() {
+        return this._attackRangeMax;
     }
 
     _inferProperties() {
@@ -674,6 +763,43 @@ class Simulacrum {
                 this._possibleTypes.delete('thick-sludge');
                 this._possibleTypes.delete('archer');
             }
+
+            // Remove possibilities based on damage sustained.
+            if (this.isAlive()) {
+                if (this._damage >= 3) {
+                    this._possibleTypes.delete('wizard');
+                }
+
+                if (this._damage >= 7) {
+                    this._possibleTypes.delete('archer');
+                }
+
+                if (this._damage >= 12) {
+                    this._possibleTypes.delete('sludge');
+                }
+            } else {
+                if (this._damage < 7) {
+                    // It's a wizard.
+                    this._possibleTypes.delete('sludge');
+                    this._possibleTypes.delete('thick-sludge');
+                    this._possibleTypes.delete('archer');
+                } else if (7 <= this._damage && this._damage < 12) {
+                    // It's an archer.
+                    this._possibleTypes.delete('sludge');
+                    this._possibleTypes.delete('thick-sludge');
+                    this._possibleTypes.delete('wizard');
+                } else if (12 <= this._damage && this._damage < 24) {
+                    // It's a sludge.
+                    this._possibleTypes.delete('thick-sludge');
+                    this._possibleTypes.delete('archer');
+                    this._possibleTypes.delete('wizard');
+                } else {
+                    // It's a thick sludge.
+                    this._possibleTypes.delete('sludge');
+                    this._possibleTypes.delete('archer');
+                    this._possibleTypes.delete('wizard');
+                }
+            }
         }
 
         // Infer all properties when I've whittled the possiblities down to one.
@@ -682,6 +808,7 @@ class Simulacrum {
 
             if (this._type === 'sludge') {
                 this._maxHealth = 12;
+                this._attackDamageMax = 3;
 
                 if (this._attacks) {
                     this._attackDamage = 3;
@@ -689,6 +816,7 @@ class Simulacrum {
                 }
             } else if (this._type === 'thick-sludge') {
                 this._maxHealth = 24;
+                this._attackDamageMax = 3;
 
                 if (this._attacks) {
                     this._attackDamage = 3;
@@ -698,34 +826,55 @@ class Simulacrum {
                 this._maxHealth = 7;
                 this._attacks = true;
                 this._attackDamage = 3;
+                this._attackDamageMax = 3;
                 this._attackRange = 3;
             } else if (this._type === 'wizard') {
                 this._maxHealth = 3;
                 this._attacks = true;
                 this._attackDamage = 11;
+                this._attackDamageMax = 11;
                 this._attackRange = 3;
             }
         }
 
-        // Infer some properties when I've whittled the possiblities down to two.
+        // Check if I'm dealing with a ranged enemy.
         if (this._possibleTypes.size === 2) {
             if (this._possibleTypes.has('wizard')) {
                 if (this._possibleTypes.has('archer')) {
                     this._attacks = true;
                     this._attackRange = 3;
                 }
-            } else if (this._attacks === true) {
-                this._attackDamage = 3;
+            }
+        }
+
+        // Try to infer some properties even when there are still many possibilities.
+        if (this._possibleTypes.size >= 2) {
+            if (!this._possibleTypes.has('wizard')) {
+                this._attackDamageMax = 3;
 
                 if (!this._possibleTypes.has('archer')) {
                     this._attackRange = 1;
+                }
+
+                if (this._attacks === true) {
+                    this._attackDamage = 3;
                 }
             }
         }
 
         // Cleanup.
+        if (this._doesntAttackLongRange) {
+            this._attackRangeMax = 1;
+            this._attackDamageMax = 3;
+        }
+
+        if (this._attackRange != null) {
+            this._attackRangeMax = this._attackRange;
+        }
+
         if (this._attacks === false) {
             this._attackDamage = 0;
+            this._attackDamageMax = 0;
             this._attackRange = 0;
         }
     }
